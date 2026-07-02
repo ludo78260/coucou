@@ -328,6 +328,30 @@
       padding: 4px 8px;
     }
 
+    .media-content {
+      padding: 7px;
+      background: rgba(255, 255, 255, 0.10);
+      border: 1px solid rgba(255, 228, 236, 0.16);
+    }
+
+    .chat-image {
+      display: block;
+      width: min(245px, 68vw);
+      max-height: 320px;
+      object-fit: contain;
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.08);
+    }
+
+    .image-caption {
+      display: block;
+      margin-top: 6px;
+      padding: 0 5px 2px;
+      color: rgba(255, 228, 236, 0.72);
+      font-size: 0.72rem;
+      overflow-wrap: anywhere;
+    }
+
     #chat-input-area {
       display: flex;
       gap: 10px;
@@ -352,13 +376,22 @@
       box-shadow: 0 0 0 4px rgba(225, 29, 72, 0.16);
     }
 
-    #send-btn {
+    #send-btn,
+    #image-btn {
       color: #fff;
       background: linear-gradient(135deg, #e11d48, #9333ea);
       padding-inline: 18px;
     }
 
-    #send-btn:hover { background: linear-gradient(135deg, #be123c, #7e22ce); }
+    #image-btn {
+      width: 48px;
+      min-width: 48px;
+      padding-inline: 0;
+      font-size: 1.08rem;
+    }
+
+    #send-btn:hover,
+    #image-btn:hover { background: linear-gradient(135deg, #be123c, #7e22ce); }
 
     #status {
       min-height: 22px;
@@ -392,6 +425,7 @@
       #qr-container canvas { width: min(260px, calc(100vw - 96px)) !important; height: min(260px, calc(100vw - 96px)) !important; }
       #chat-messages { min-height: 330px; height: calc(100vh - 260px); }
       #send-btn { padding-inline: 14px; }
+      #image-btn { width: 44px; min-width: 44px; }
     }
   </style>
 </head>
@@ -426,6 +460,8 @@
       <section id="chat-section" class="panel" aria-live="polite">
         <div id="chat-messages"></div>
         <div id="chat-input-area">
+          <button id="image-btn" type="button" title="Envoyer une image" aria-label="Envoyer une image" disabled>📷</button>
+          <input type="file" id="image-input" accept="image/*" hidden />
           <input type="text" id="chat-input" placeholder="Écris-lui un message…" autocomplete="off" maxlength="2000" disabled />
           <button id="send-btn" type="button" disabled>Envoyer</button>
         </div>
@@ -469,6 +505,8 @@
       const chatMessages = document.getElementById("chat-messages");
       const chatInput = document.getElementById("chat-input");
       const sendBtn = document.getElementById("send-btn");
+      const imageBtn = document.getElementById("image-btn");
+      const imageInput = document.getElementById("image-input");
       const statusDiv = document.getElementById("status");
 
       let peer = null;
@@ -476,6 +514,10 @@
       let roomId = null;
       let myPeerId = null;
       let shareUrl = "";
+      const MAX_IMAGE_DIMENSION = 1280;
+      const MAX_IMAGE_PAYLOAD_BYTES = 2.5 * 1024 * 1024;
+      const IMAGE_CHUNK_SIZE = 64 * 1024;
+      const pendingImages = new Map();
 
       function generateToken(size = 10) {
         const alphabet = "abcdefghjkmnpqrstuvwxyz23456789";
@@ -517,6 +559,153 @@
         chatMessages.scrollTop = chatMessages.scrollHeight;
       }
 
+      function addImageMessage({ dataUrl, name }, kind = "remote") {
+        const message = document.createElement("div");
+        message.className = `message ${kind}`;
+
+        const author = document.createElement("span");
+        author.className = "author";
+        author.textContent = kind === "local" ? "Moi" : "Correspondant";
+        message.appendChild(author);
+
+        const content = document.createElement("span");
+        content.className = "content media-content";
+
+        const img = document.createElement("img");
+        img.className = "chat-image";
+        img.alt = name || "Image envoyée";
+        img.loading = "lazy";
+        img.src = dataUrl;
+        content.appendChild(img);
+
+        if (name) {
+          const caption = document.createElement("span");
+          caption.className = "image-caption";
+          caption.textContent = name;
+          content.appendChild(caption);
+        }
+
+        message.appendChild(content);
+        chatMessages.appendChild(message);
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+      }
+
+      function bytesFromDataUrl(dataUrl) {
+        const base64 = String(dataUrl).split(",")[1] || "";
+        return Math.ceil(base64.length * 0.75);
+      }
+
+      function blobToDataUrl(blob) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => reject(reader.error || new Error("Lecture de l’image impossible."));
+          reader.readAsDataURL(blob);
+        });
+      }
+
+      function canvasToBlob(canvas, type, quality) {
+        return new Promise((resolve, reject) => {
+          canvas.toBlob(blob => {
+            if (blob) resolve(blob);
+            else reject(new Error("Compression de l’image impossible."));
+          }, type, quality);
+        });
+      }
+
+      async function prepareImage(file) {
+        if (!file || !file.type || !file.type.startsWith("image/")) {
+          throw new Error("Choisis un fichier image valide.");
+        }
+
+        const sourceUrl = URL.createObjectURL(file);
+        try {
+          const image = new Image();
+          image.decoding = "async";
+          await new Promise((resolve, reject) => {
+            image.onload = resolve;
+            image.onerror = () => reject(new Error("Cette image ne peut pas être lue par le navigateur."));
+            image.src = sourceUrl;
+          });
+
+          const ratio = Math.min(1, MAX_IMAGE_DIMENSION / Math.max(image.naturalWidth, image.naturalHeight));
+          const width = Math.max(1, Math.round(image.naturalWidth * ratio));
+          const height = Math.max(1, Math.round(image.naturalHeight * ratio));
+
+          const canvas = document.createElement("canvas");
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(image, 0, 0, width, height);
+
+          let quality = 0.82;
+          let blob = await canvasToBlob(canvas, "image/jpeg", quality);
+
+          while (blob.size > MAX_IMAGE_PAYLOAD_BYTES && quality > 0.48) {
+            quality -= 0.12;
+            blob = await canvasToBlob(canvas, "image/jpeg", quality);
+          }
+
+          if (blob.size > MAX_IMAGE_PAYLOAD_BYTES) {
+            throw new Error("Image trop lourde. Essaie une image plus petite.");
+          }
+
+          const dataUrl = await blobToDataUrl(blob);
+          return {
+            type: "image",
+            name: file.name || "photo.jpg",
+            mime: "image/jpeg",
+            dataUrl,
+            sentAt: Date.now()
+          };
+        } finally {
+          URL.revokeObjectURL(sourceUrl);
+        }
+      }
+
+      function receiveImageMeta(data) {
+        if (!data.id || !Number.isInteger(data.total) || data.total < 1 || data.total > 500) return;
+        pendingImages.set(data.id, {
+          name: data.name || "photo.jpg",
+          mime: data.mime || "image/jpeg",
+          total: data.total,
+          chunks: new Array(data.total),
+          received: 0,
+          createdAt: Date.now()
+        });
+        setStatus("Réception d’une image…", "#f9a8d4");
+      }
+
+      function receiveImageChunk(data) {
+        const pending = pendingImages.get(data.id);
+        if (!pending || !Number.isInteger(data.index) || data.index < 0 || data.index >= pending.total) return;
+
+        if (typeof data.chunk !== "string") return;
+        if (!pending.chunks[data.index]) {
+          pending.chunks[data.index] = data.chunk;
+          pending.received += 1;
+        }
+
+        if (pending.received === pending.total) {
+          const dataUrl = pending.chunks.join("");
+          pendingImages.delete(data.id);
+          if (dataUrl.startsWith("data:image/")) {
+            addImageMessage({ dataUrl, name: pending.name, mime: pending.mime }, "remote");
+            setStatus("Image reçue ✅", "#fb7185");
+            setTimeout(() => {
+              if (conn && conn.open) setStatus("Connecté en pair-à-pair ✅", "#16a34a");
+            }, 1600);
+          }
+        }
+      }
+
+      function cleanupOldPendingImages() {
+        const now = Date.now();
+        for (const [id, pending] of pendingImages) {
+          if (now - pending.createdAt > 120000) pendingImages.delete(id);
+        }
+      }
+
       function showChat() {
         roomSection.style.display = "none";
         chatSection.style.display = "grid";
@@ -525,6 +714,7 @@
       function enableChat(enabled) {
         chatInput.disabled = !enabled;
         sendBtn.disabled = !enabled;
+        imageBtn.disabled = !enabled;
         if (enabled) chatInput.focus();
       }
 
@@ -616,6 +806,12 @@
             return;
           }
           if (data.type === "message") addMessage(data.text || "", "remote");
+          if (data.type === "image" && typeof data.dataUrl === "string" && data.dataUrl.startsWith("data:image/")) {
+            addImageMessage(data, "remote");
+          }
+          if (data.type === "image-meta") receiveImageMeta(data);
+          if (data.type === "image-chunk") receiveImageChunk(data);
+          cleanupOldPendingImages();
         });
 
         conn.on("close", () => {
@@ -715,8 +911,59 @@
         chatInput.value = "";
       }
 
+      async function sendImage(file) {
+        if (!file) return;
+
+        if (!conn || !conn.open) {
+          setStatus("Pas de connexion active.", "#dc2626");
+          return;
+        }
+
+        try {
+          imageBtn.disabled = true;
+          setStatus("Préparation de l’image…", "#f9a8d4");
+          const imageMessage = await prepareImage(file);
+          const payloadSize = bytesFromDataUrl(imageMessage.dataUrl);
+          if (payloadSize > MAX_IMAGE_PAYLOAD_BYTES * 1.4) {
+            throw new Error("Image trop lourde pour l’envoi pair-à-pair.");
+          }
+
+          const transferId = "img-" + generateToken(14);
+          const total = Math.ceil(imageMessage.dataUrl.length / IMAGE_CHUNK_SIZE);
+          conn.send({
+            type: "image-meta",
+            id: transferId,
+            name: imageMessage.name,
+            mime: imageMessage.mime,
+            total,
+            size: payloadSize,
+            sentAt: imageMessage.sentAt
+          });
+
+          for (let index = 0; index < total; index += 1) {
+            const chunk = imageMessage.dataUrl.slice(index * IMAGE_CHUNK_SIZE, (index + 1) * IMAGE_CHUNK_SIZE);
+            conn.send({ type: "image-chunk", id: transferId, index, chunk });
+            if (index % 8 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+          }
+
+          addImageMessage(imageMessage, "local");
+          setStatus("Image envoyée ✅", "#fb7185");
+          setTimeout(() => {
+            if (conn && conn.open) setStatus("Connecté en pair-à-pair ✅", "#16a34a");
+          }, 1600);
+        } catch (error) {
+          console.error("Erreur image", error);
+          setStatus(error.message || "Impossible d’envoyer l’image.", "#dc2626");
+        } finally {
+          if (conn && conn.open) imageBtn.disabled = false;
+          imageInput.value = "";
+        }
+      }
+
       createBtn.addEventListener("click", initCreator);
       sendBtn.addEventListener("click", sendMessage);
+      imageBtn.addEventListener("click", () => imageInput.click());
+      imageInput.addEventListener("change", () => sendImage(imageInput.files && imageInput.files[0]));
       chatInput.addEventListener("keydown", event => {
         if (event.key === "Enter" && !event.shiftKey) {
           event.preventDefault();
